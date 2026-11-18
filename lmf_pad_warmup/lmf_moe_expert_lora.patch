@@ -1,0 +1,207 @@
+给 LLaMA-Factory 补上「融合 MoE routed experts」的 LoRA —— 单文件、单 hunk。
+
+背景
+====
+HF transformers 把 Qwen3-Next / Qwen3.5-MoE / Llama4 / GPT-OSS 的 routed experts 存成融合的
+3D nn.Parameter（experts.gate_up_proj / experts.down_proj），不是 nn.Linear。
+LMF 的 find_all_linear_modules 只扫 nn.Linear，因此 routed experts 永远不可见，
+lora_target 写什么都命中不了 —— 训练全程冻结，只有 attention 和 shared expert 在学。
+本 patch 通过 PEFT 的 LoraConfig(target_parameters=...) 补上这一块。
+只改 src/llamafactory/model/adapter.py 一处，不新增文件、不改 hparams、不改 CLI。
+
+
+########################  必须先处理的两个前置冲突  ########################
+
+【冲突 1】peft 版本上限 —— 必须设 DISABLE_VERSION_CHECK=1
+--------------------------------------------------------
+ZeRO-3 下 PEFT 的 ParamWrapper 必须读 param.ds_shape，否则在 param.shape[1] 处
+IndexError（PEFT issue #2855）。该修复只在 peft main，任何 release 都没有：
+
+    v0.17.x  ds_shape 仅出现在 Conv1D 分支，ParamWrapper 无      -> ZeRO-3 挂
+    v0.18.1  shape 逻辑内联在 __init__，裸 param.shape           -> ZeRO-3 挂
+    v0.20.0  同上                                                -> ZeRO-3 挂
+    main     shape = getattr(param, "ds_shape", param.shape)     -> 可用
+
+但 LMF 的 check_dependencies() 有 peft 上限，且升级 LMF 也绕不过：
+
+    你当前的 LMF   : peft>=0.18.0,<=0.18.1
+    LMF main       : peft>=0.18.0,<=0.20.0
+    peft main 实际 : 0.20.1.dev0   -> 仍然大于 0.20.0
+
+=> 必须跳过版本检查（LMF 官方提供的开关，报错信息里也给了）：
+
+    export DISABLE_VERSION_CHECK=1
+
+它会跳过 transformers / datasets / accelerate / peft / trl 全部 5 项版本检查。
+实际风险低（只有 peft 是你主动升级的，其余仍是环境自带版本），
+但请务必先跑 max_steps=10 的 dry-run，确认没有其他 API 不兼容再上全量。
+
+如果不想跳过全部检查，替代方案是改 LMF 一行（额外一处改动）：
+    src/llamafactory/extras/misc.py
+    -    check_version("peft>=0.18.0,<=0.18.1")
+    +    check_version("peft>=0.18.0")
+
+
+【冲突 2】lora_dropout 必须为 0 —— 这是 PEFT 的架构性限制，不是 bug
+------------------------------------------------------------------
+ParamWrapper 把 LoRA delta 用 baddbmm 融合进 base weight，而不是走
+lora_B(lora_A(dropout(x)))，因此无法插入 dropout。PEFT 源码注释：
+
+    # It's not possible to factor out x from lora_B(lora_A(dropout(x))),
+    # so dropout can't be correctly implemented
+    raise ValueError("lora.ParamWrapper does not work with lora_dropout != 0.")
+
+v0.18.1 和 main 都在 __init__ 与 update_layer 两处拒绝，且不会被修复。
+PEFT 有 rank_pattern / alpha_pattern，但**没有 dropout_pattern**，
+所以无法做到「非 expert 层 0.05、expert 层 0」的分层配置。
+
+=> 你的 YAML 必须把 lora_dropout 从 0.05 改成 0.0：
+
+    lora_dropout: 0.0
+
+本 patch 会在启动时主动检查并给出这段提示，不会让你跑到 PEFT 内部才看到
+一句没有上下文的报错。
+
+权衡：这确实偏离了 Megatron 的 lora_dropout=0.05。但对比一下量级 ——
+放弃 expert LoRA 意味着缺失 1,845,493,760 个参数（占 Megatron 容量 87.7%），
+而 dropout 只是正则化强度的差异。先把主要矛盾解决更合理。
+若一定要保留 dropout，唯一出路是把 experts unfuse 成 ModuleList[nn.Linear]
+走标准 lora.Linear 路径（支持 dropout），但那是另一个量级的工作量。
+
+#########################################################################
+
+
+事前自检（不看版本号，直接验代码）
+================================
+    python -c "import inspect, peft; from peft.tuners.lora.layer import ParamWrapper as P; \
+print('peft', peft.__version__); \
+print('ds_shape ok:', 'ds_shape' in inspect.getsource(getattr(P, '_get_in_out_features', P.__init__)))"
+
+必须打印 ds_shape ok: True。
+
+应用
+====
+    cd /path/to/LLaMA-Factory
+    git apply --check lmf_moe_expert_lora.patch
+    git apply lmf_moe_expert_lora.patch
+
+使用（环境变量控制，不设则行为与原版完全一致，可安全合并到自有分支）
+============================================================
+    export DISABLE_VERSION_CHECK=1                      # 冲突 1，必须
+    export MOE_EXPERT_LORA=auto                          # 自动探测 3D expert 参数
+    # 或显式: MOE_EXPERT_LORA=mlp.experts.gate_up_proj,mlp.experts.down_proj
+    export MOE_EXPERT_LORA_RANK=4                        # 可选，见下
+
+YAML 同时需要:
+    lora_dropout: 0.0                                    # 冲突 2，必须
+
+MOE_EXPERT_LORA_RANK 不设 -> 沿用 lora_rank，每个 expert 一个满 rank adapter，与 Megatron 对齐。
+设为 lora_rank/num_active_experts 是 "LoRA Without Regret" 的建议（省显存）。
+
+启动后 rank0 日志应出现：
+
+    MoE expert LoRA on ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'] | rank=32 |
+    expected extra trainable=1,845,493,760
+
+把这个数字加上原本的 trainable params，就是新的总量，用它对 dry-run 日志。
+
+代价（Qwen3.5-MoE 35B-A3B，E=256，r=32，40 层，ZeRO-3 8 卡）
+=========================================================
+    r=32 -> 1,845,493,760  常驻 +4.30 GiB/卡      （对齐 Megatron）
+    r= 8 ->   461,373,440  常驻 +1.07 GiB/卡
+    r= 4 ->   230,686,720  常驻 +0.54 GiB/卡      （r/num_active_experts）
+    r= 1 ->    57,671,680  常驻 +0.13 GiB/卡
+另每层 baddbmm 融合副本峰值约 1.50 GiB（gradient_checkpointing 下不叠加）。
+PEFT 会为全部 256 个 expert 物化 LoRA delta（与 top-k 无关），吞吐必然下降；
+推理前务必 merge_and_unload()。
+显存吃紧时优先降 MOE_EXPERT_LORA_RANK，而不是减少 expert 数量 ——
+融合参数无法按 expert index 选择（rank_pattern 只按模块名匹配），
+选 top-k 必须先 unfuse 成 ModuleList。
+
+--- a/src/llamafactory/model/adapter.py
++++ b/src/llamafactory/model/adapter.py
+@@ -262,8 +262,84 @@
+                 "lora_dropout": finetuning_args.lora_dropout,
+                 "use_rslora": finetuning_args.use_rslora,
+                 "use_dora": finetuning_args.use_dora,
+                 "modules_to_save": finetuning_args.additional_target,
+             }
++            import os as _os
++
++            _moe_env = _os.environ.get("MOE_EXPERT_LORA", "").strip()
++            if _moe_env and _moe_env.lower() not in ("0", "off", "false", "no"):
++                import inspect as _insp
++
++                if "target_parameters" not in _insp.signature(LoraConfig).parameters:
++                    raise RuntimeError(
++                        "MOE_EXPERT_LORA is set but the installed peft has no `target_parameters`. "
++                        "Run: pip install -U git+https://github.com/huggingface/peft.git"
++                    )
++                if finetuning_args.lora_dropout:
++                    raise ValueError(
++                        f"MOE_EXPERT_LORA requires lora_dropout=0 (got {finetuning_args.lora_dropout}). "
++                        "PEFT's ParamWrapper folds the LoRA delta into the base weight via baddbmm, so "
++                        "lora_B(lora_A(dropout(x))) cannot be factored out; dropout is rejected by design "
++                        "in every peft version and there is no dropout_pattern to scope it per module. "
++                        "Set `lora_dropout: 0.0` in the YAML, or unfuse the experts into "
++                        "ModuleList[nn.Linear] to keep dropout."
++                    )
++                if is_deepspeed_zero3_enabled():
++                    from peft.tuners.lora.layer import ParamWrapper as _PW
++
++                    _pw_src = _insp.getsource(getattr(_PW, "_get_in_out_features", _PW.__init__))
++                    if "ds_shape" not in _pw_src:
++                        raise RuntimeError(
++                            "MOE_EXPERT_LORA with ZeRO-3 needs a peft that reads `param.ds_shape` in "
++                            "ParamWrapper (peft issue #2855); every released version raises IndexError "
++                            "on the partitioned `param.shape`. "
++                            "Run: pip install -U git+https://github.com/huggingface/peft.git"
++                        )
++
++                _named = dict(model.named_parameters())
++
++                def _shape(param):
++                    return tuple(getattr(param, "ds_shape", param.shape))
++
++                if _moe_env.lower() == "auto":
++                    target_parameters = []
++                    for _name, _param in _named.items():
++                        if "expert" in _name and len(_shape(_param)) == 3:
++                            _suffix = ".".join(_name.split(".")[-3:])
++                            if _suffix not in target_parameters:
++                                target_parameters.append(_suffix)
++                else:
++                    target_parameters = [s.strip() for s in _moe_env.split(",") if s.strip()]
++                    _missing = [s for s in target_parameters if not any(n.endswith(s) for n in _named)]
++                    if _missing:
++                        raise ValueError(
++                            f"MOE_EXPERT_LORA names not found in the model: {_missing}. Inspect with "
++                            "[n for n, _ in model.named_parameters() if 'expert' in n]"
++                        )
++
++                if not target_parameters:
++                    logger.warning_rank0(
++                        "MOE_EXPERT_LORA=auto found no fused 3d expert parameter. If the experts are "
++                        "plain nn.Linear modules, use `lora_target` instead."
++                    )
++                else:
++                    peft_kwargs["target_parameters"] = target_parameters
++                    _rank_env = _os.environ.get("MOE_EXPERT_LORA_RANK", "").strip()
++                    _expert_rank = int(_rank_env) if _rank_env else finetuning_args.lora_rank
++                    if _rank_env:
++                        peft_kwargs["rank_pattern"] = {
++                            ".".join(s.split(".")[-2:]): _expert_rank for s in target_parameters
++                        }
++                    _extra = sum(
++                        _shape(_param)[0] * _expert_rank * (_shape(_param)[1] + _shape(_param)[2])
++                        for _suffix in target_parameters
++                        for _name, _param in _named.items()
++                        if _name.endswith(_suffix) and len(_shape(_param)) == 3
++                    )
++                    logger.info_rank0(
++                        f"MoE expert LoRA on {target_parameters} | rank={_expert_rank} | "
++                        f"expected extra trainable={_extra:,}"
++                    )
+         elif finetuning_args.finetuning_type == "oft":
+             peft_kwargs = {
+                 "r": finetuning_args.oft_rank,

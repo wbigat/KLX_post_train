@@ -1,0 +1,440 @@
+--- a/swift/megatron/trainers/base.py	2026-09-20 23:18:05.340008802 +0800
++++ b/swift/megatron/trainers/base.py	2026-09-20 20:11:45.642942176 +0800
+@@ -41,6 +41,7 @@
+ from swift.utils import (deep_getattr, gc_collect, get_current_device, get_last_valid_indices, get_logger, is_last_rank,
+                          is_master, ms_logger_context)
+ from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
++from .pad_warmup import wrap_pad_warmup
+ from .utils import TrainerState, build_streaming_dataloader, prepare_batch
+ 
+ try:
+@@ -935,6 +936,12 @@
+ 
+     def _prepare_dataloader(self, train_dataset, val_dataset=None):
+         args = self.args
++        # Pad-warmup (padding_free): pad the first batch(es) to the peak packed length so the
++        # caching allocator reserves the peak-shaped segments up-front. The dataset is only
++        # available here, so the length scan happens here. SWIFT_PAD_WARMUP=0 disables it.
++        if not getattr(self, '_pad_warmup_wrapped', False):
++            self._pad_warmup_wrapped = True
++            self.data_collator = wrap_pad_warmup(self.data_collator, args, train_dataset, self.template)
+         val_dataloader = None
+         if args.streaming:
+             train_dataloader = build_streaming_dataloader(args, train_dataset, self.data_collator)
+--- /dev/null	2026-09-20 12:58:32.538123769 +0800
++++ b/swift/megatron/trainers/pad_warmup.py	2026-09-20 22:26:22.157217966 +0800
+@@ -0,0 +1,286 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Pad-warmup for padding_free megatron training: pad the first batch(es) to the peak packed
++length to fight memory fragmentation when `expandable_segments` is unavailable.
++
++Why
++---
++With `padding_free`, a micro-batch is one packed row whose length is the *sum* of the sample
++lengths, so it varies with the data order. On allocators without `expandable_segments`, the
++caching allocator cannot grow a freed segment in place: once the memory is carved into small
++segments by early (short) batches, a later (longer) batch cannot find a contiguous block even
++though the *total* free memory is enough:
++
++    torch.OutOfMemoryError: Tried to allocate 15.60 GiB. GPU 3 has a total capacity of 96.00 GiB
++    of which 38.53 GiB is free...
++
++The fix: pad the FIRST batch to the peak packed length, so the allocator reserves the big
++segments up-front and every later batch -- whose length is <= the warm-up one -- reuses them.
++
++How (dummy segment)
++-------------------
++A single dummy sample of ``warmup_len - real_total`` tokens is appended to the batch before
++``packing_row``. ``packing_row`` assigns it ``position_ids = range(pad)``, so it becomes ONE
++extra segment in ``cu_seqlens`` (a segment boundary is every ``position_ids == 0``). The dummy
++keeps ``labels = -100`` / ``loss_scale = 0``, so it contributes neither loss nor gradient, and
++being a separate causal segment it cannot influence the real tokens.
++
++Padding length
++--------------
++* packing:      the peak is the packing length itself -> ``max_length``;
++* non-packing:  ``min(micro_batch_size * max_length, sum of the top-micro_batch_size sample
++  lengths)`` (an exact upper bound of any shuffled micro-batch total), aligned up to
++  ``get_padding_to(args)``.
++
++``SWIFT_PAD_WARMUP_LENGTH`` overrides everything and is used as-is (then aligned).
++
++Guarantees / caveats
++--------------------
++* No extra step and no dummy forward/backward: the warm-up batch is a real training micro-batch.
++* LM loss / gradient is unchanged (``labels=-100``, ``loss_scale=0``).
++* The dummy tokens are *sampled from the real batch* (not a single pad id), so the MoE router
++  sees a near-real token distribution and the load-balancing stays balanced.
++* MoE aux loss of the warm-up micro-batch still differs slightly (aux loss is not scaled by
++  ``loss_scale``); it only affects the warm-up micro-batches.
++* Only enabled for plain causal-LM training (``mode in {'transformers', 'train'}``). RLHF/PRM
++  trainers index per-segment logits via ``packed_seq_params.seq_lens``; an extra segment would
++  shift the count, so they are excluded.
++* ``context_parallel_size > 1`` is not supported.
++
++Usage
++-----
++    SWIFT_PAD_WARMUP=1                 # 0 disables it (A/B comparison)
++    SWIFT_PAD_WARMUP_LENGTH=8192       # explicit target packed length
++"""
++import math
++import os
++from typing import Any, Callable, Dict, List, Optional
++
++from swift.utils import get_env_args, get_logger
++
++logger = get_logger()
++
++# How many of the first micro-batches each dataloader worker pads to the warm-up length.
++_WARMUP_BATCHES = 1
++
++
++def _scan_num_proc(args) -> int:
++    """Number of fork workers for the length scan (scales with `dataset_num_proc`)."""
++    return max(1, min(32, (getattr(args, 'dataset_num_proc', 1) or 1) * 4))
++
++
++def _align(length: int, args) -> int:
++    """Round the warm-up length up to the attention-backend alignment (`get_padding_to`)."""
++    try:
++        from swift.megatron.utils.utils import get_padding_to
++        padding_to = get_padding_to(args)
++    except Exception:
++        padding_to = None
++    if padding_to:
++        return math.ceil(length / padding_to) * padding_to
++    return length
++
++
++def get_pad_warmup_length(args, dataset, template) -> Optional[int]:
++    """Resolve the warm-up peak length, ``None`` disables it.
++
++    统一 dummy 段方案, 与 padding_free 开关无关:
++    * padding_free: 行长 = Σ样本长度, 峰值 W = min(mbs * max_length, top-mbs 样本长度之和),
++      dummy 追加在 packing_row 之前, 独立成段;
++    * 非 padding_free: batch 形状 = [mbs, 批内最长样本], 峰值 W = min(max_length, 数据集最长样本),
++      dummy 为一条长度 W 的样本, 顶起整批右 pad 后在 collate 末尾切掉。
++    """
++    if not get_env_args('SWIFT_PAD_WARMUP', bool, True):
++        return None
++    if getattr(args, 'context_parallel_size', 1) > 1:
++        logger.info_once('[pad_warmup] Disabled: context_parallel_size > 1 is not supported.')
++        return None
++    if getattr(template, 'mode', 'train') not in ('transformers', 'train'):
++        # RLHF/PRM trainers index per-segment logits via packed_seq_params.seq_lens; an extra
++        # dummy segment would shift the segment count.
++        logger.info_once(f'[pad_warmup] Disabled: template.mode={getattr(template, "mode", None)!r}.')
++        return None
++
++    max_length = getattr(args, 'max_length', None) or getattr(args, 'seq_length', None)
++    if not max_length or max_length <= 0:
++        return None
++    max_length = int(max_length)
++
++    if getattr(args, 'packing', False):
++        # packing bins are capped at max_length, so that is the peak packed length.
++        return _align(max_length, args)
++
++    length = os.environ.get('SWIFT_PAD_WARMUP_LENGTH')
++    if length:
++        return _align(int(length), args)
++
++    padding_free = getattr(args, 'padding_free', False)
++    mbs = (getattr(args, 'micro_batch_size', 1) or 1) if padding_free else 1
++    top_sum = scan_topk_sample_length(dataset, template, args, k=mbs)
++    bound = mbs * max_length
++    if top_sum is None:
++        logger.warning(f'[pad_warmup] Dataset scan failed; fall back to {bound}.')
++        return _align(bound, args)
++    return _align(min(bound, top_sum), args)
++
++
++# The template is shared with the scan workers through fork (copy-on-write), because pickling it
++# (e.g. via `datasets.map(num_proc=...)`) drops the initialized processor.
++_SCAN_TEMPLATE = None
++
++
++def _scan_row(row: Dict[str, Any]) -> int:
++    """Map one dataset row to its token length; 0 for failed samples."""
++    try:
++        encoded = _SCAN_TEMPLATE.encode(row, return_length=True)
++        lengths = encoded.get('lengths') or [len(encoded['input_ids'])]
++        return max(lengths)
++    except Exception:
++        return 0
++
++
++def _topk_sum(lengths: List[int], k: int) -> Optional[int]:
++    vals = sorted((int(v) for v in lengths if v), reverse=True)[:max(1, k)]
++    return sum(vals) if vals else None
++
++
++def scan_topk_sample_length(dataset, template, args, k: int) -> Optional[int]:
++    """Scan once and return the sum of the top-`k` sample token lengths.
++
++    A shuffled micro-batch holds `k` samples, so its packed length never exceeds this sum. Uses a
++    precomputed `length(s)` column when available, otherwise runs `template.encode` over the whole
++    dataset once on rank 0 (fork pool), broadcasts the result and caches it on disk.
++    """
++    if dataset is None:
++        return None
++    try:
++        n = len(dataset)
++    except Exception:
++        return None
++    if n == 0:
++        return None
++
++    from swift.dataset.utils import LazyLLMDataset
++    hf_ds = dataset.dataset if isinstance(dataset, LazyLLMDataset) else dataset
++
++    # Fast path: a precomputed length column (lazy_tokenize=False).
++    for col in ('lengths', 'length'):
++        try:
++            vals = hf_ds[col]
++            if vals is not None and len(vals):
++                lengths = [(max(v) if isinstance(v, (list, tuple)) else int(v)) for v in vals]
++                return _topk_sum(lengths, k)
++        except Exception:
++            pass
++
++    # Exact scan on the global main rank, then broadcast.
++    import torch
++    import torch.distributed as dist
++    dist_inited = dist.is_available() and dist.is_initialized()
++    rank = dist.get_rank() if dist_inited else 0
++    if rank == 0:
++        top_sum = _scan_topk_rank0(hf_ds, template, args, n, k) or 0
++    else:
++        top_sum = 0
++    if dist_inited:
++        tensor = torch.tensor([top_sum], dtype=torch.long, device=torch.cuda.current_device())
++        dist.broadcast(tensor, src=0)
++        top_sum = int(tensor.item())
++    if rank == 0:
++        logger.info(f'[pad_warmup] sum of top-{k} sample lengths = {top_sum or None}.')
++    return top_sum or None
++
++
++def _scan_cache_path(args, k: int) -> str:
++    import hashlib
++    import json
++    key_src = json.dumps(
++        {
++            'dataset': getattr(args, 'dataset', None),
++            'max_length': getattr(args, 'max_length', None),
++            'template': getattr(args, 'template', None),
++            'micro_batch_size': k,
++            'fps': os.environ.get('FPS'),
++            'fps_max_frames': os.environ.get('FPS_MAX_FRAMES'),
++            'video_max_pixels': os.environ.get('VIDEO_MAX_PIXELS'),
++            'max_pixels': os.environ.get('MAX_PIXELS'),
++        },
++        sort_keys=True,
++        default=str)
++    digest = hashlib.md5(key_src.encode()).hexdigest()[:16]
++    cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'swift', 'pad_warmup')
++    os.makedirs(cache_dir, exist_ok=True)
++    return os.path.join(cache_dir, f'top{k}_sum_{digest}.txt')
++
++
++def _scan_topk_rank0(hf_ds, template, args, n: int, k: int) -> Optional[int]:
++    """Scan (on the main rank) for the top-k length sum, using the on-disk cache if present."""
++    cache_path = _scan_cache_path(args, k)
++    if os.path.isfile(cache_path):
++        try:
++            with open(cache_path) as f:
++                cached = int(f.read().strip())
++            logger.info(f'[pad_warmup] Using the cached top-{k} length sum: {cached} ({cache_path}).')
++            return cached
++        except Exception:
++            pass
++
++    global _SCAN_TEMPLATE
++    _SCAN_TEMPLATE = template
++    num_proc = _scan_num_proc(args)
++    logger.info(f'[pad_warmup] Scanning {n} samples (num_proc={num_proc})...')
++    try:
++        import multiprocessing as mp
++        with mp.get_context('fork').Pool(num_proc) as pool:
++            lengths = pool.map(_scan_row, hf_ds, chunksize=max(1, n // (num_proc * 8)))
++        top_sum = _topk_sum([v for v in lengths if v], k)
++        logger.info(f'[pad_warmup] Scan finished: {n} rows, top-{k} sum = {top_sum}.')
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Failed to scan the dataset: {e}')
++        return None
++
++    if top_sum:
++        try:
++            with open(cache_path, 'w') as f:
++                f.write(str(top_sum))
++        except Exception:
++            pass
++    return top_sum
++
++
++class PadWarmupCollator:
++    """Wrap a data collator so that the first `num_batches` batch(es) are padded to `length`.
++
++    `num_batches` is consumed per process: with `dataloader_num_workers > 0` every worker owns a
++    copy of the collator and pads its own first batch(es).
++    """
++
++    def __init__(self, collator: Callable[..., Dict[str, Any]], length: int, num_batches: int = 1):
++        self.collator = collator
++        self.length = length
++        self.num_batches = num_batches
++
++    def __call__(self, batch: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
++        if self.num_batches <= 0:
++            return self.collator(batch, **kwargs)
++        self.num_batches -= 1
++        logger.info_once(f'[pad_warmup] Padding the first batch to {self.length} (pid {os.getpid()}).',
++                         hash_id='pad_warmup')
++        return self.collator(batch, pad_to_length=self.length, **kwargs)
++
++    def __repr__(self) -> str:
++        return (f'PadWarmupCollator(length={self.length}, num_batches={self.num_batches}, '
++                f'collator={self.collator})')
++
++
++def wrap_pad_warmup(data_collator: Callable[..., Dict[str, Any]],
++                    args,
++                    dataset=None,
++                    template=None) -> Callable[..., Dict[str, Any]]:
++    """Pad the first batch(es) to the peak packed length, see the module docstring."""
++    length = get_pad_warmup_length(args, dataset, template)
++    if length is None:
++        return data_collator
++    logger.info_once(f'[pad_warmup] warmup: pad the first {_WARMUP_BATCHES} batch(es) '
++                     f'per dataloader worker to {length} '
++                     f'(padding_free={getattr(args, "padding_free", False)}).')
++    return PadWarmupCollator(data_collator, length, _WARMUP_BATCHES)
+--- a/swift/template/base.py	2026-09-20 23:19:09.365663743 +0800
++++ b/swift/template/base.py	2026-09-21 11:35:33.545702294 +0800
+@@ -1647,10 +1647,18 @@
+         self._deepspeed_initialize = None
+         return models
+ 
+-    def data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
++    def data_collator(self,
++                      batch: List[Dict[str, Any]],
++                      *,
++                      padding_to: Optional[int] = None,
++                      pad_to_length: Optional[int] = None) -> Dict[str, Any]:
+         from swift.dataset import RowPreprocessor
+         if self.packing and isinstance(batch[0], list):
+             batch = sum(batch, start=[])
++        # Pad-warmup (megatron): 向首个 batch 追加一条 dummy 样本, 让分配器在 step 1 就按峰值
++        # 形状预留显存。dummy 为纯文本 token / labels=-100 / loss_scale=0; padding_free 下它成为
++        # 独立新段, 普通 batch 下它在 collate 后被切除(_pad_warmup_pop_dummy), 对原功能零影响。
++        n_dummy = self._pad_warmup_append_dummy(batch, pad_to_length)
+         if self.task_type == 'causal_lm':
+             if self.mode in {'transformers', 'train'}:
+                 res = self._data_collator(batch, padding_to=padding_to)
+@@ -1675,6 +1683,8 @@
+             extra_kwargs = [b['_extra_kwargs'] for b in batch if b.get('_extra_kwargs') is not None]
+             extra_kwargs = RowPreprocessor.rows_to_batched(extra_kwargs)
+             res.update({k: v for k, v in extra_kwargs.items() if k not in res})
++        if n_dummy:
++            self._pad_warmup_pop_dummy(res, len(batch) - n_dummy)
+         return res
+ 
+     @staticmethod
+@@ -1842,6 +1852,96 @@
+             res['labels'] = labels
+         return res
+ 
++    def _sample_dummy_text_ids(self, batch: List[Dict[str, Any]], n: int) -> List[int]:
++        """Sample `n` dummy input_ids from the TEXT tokens of the real batch.
++
++        仅从纯文本 token 中采样 dummy input_ids。多模态样本的媒体占位 token
++        (image/video_token_id) 数量必须与 ViT 输出的 embedding 数严格一致(masked_scatter),
++        若被采进 dummy 会导致越界访存(unspecified launch failure);
++        get_rope_index 也依赖媒体 token 与 grid_thw 一一对应, 缺失 grid 会算错 position_ids。
++        """
++        import random
++        exclude_ids = set(getattr(self.tokenizer, 'all_special_ids', None) or [])
++        for attr in ('image_token_id', 'video_token_id', 'audio_token_id'):
++            tid = getattr(self, attr, None)
++            if isinstance(tid, int):
++                exclude_ids.add(tid)
++        real_ids = []
++        for r in batch:
++            ids = r['input_ids']
++            ids = ids.tolist() if torch.is_tensor(ids) else list(ids)
++            mm_types = r.get('mm_token_type_ids')
++            if mm_types is not None:
++                mm_types = mm_types.tolist() if torch.is_tensor(mm_types) else list(mm_types)
++                ids = [i for i, t in zip(ids, mm_types) if t == 0]
++            real_ids.extend(i for i in ids if i not in exclude_ids)
++        return random.choices(real_ids, k=n) if real_ids else [self.tokenizer.pad_token_id] * n
++
++    def _pad_warmup_append_dummy(self, batch: List[Dict[str, Any]], target: Optional[int]) -> int:
++        """Append ONE dummy sample for pad-warmup (megatron SFT, both data layouts).
++
++        返回 1 表示追加的是普通 batch 的 dummy 行(collate 后需切除), 0 表示未追加或无需切除。
++
++        * padding_free(含 packing): dummy 把 packed 行补到 `target`, `packing_row` 逢 0 分段使其
++          成为独立新段, 因果隔离不影响真实 token;
++        * 普通 batch: dummy 长度 = 峰值样本长, 把整批右 pad 顶到 [mbs+1, W], 由
++          `_pad_warmup_pop_dummy` 在 collate 后切除, batch 内容精确回到 [mbs, W]。
++
++        dummy 恒为 labels=-100 / loss_scale=0, 且 input_ids 只从纯文本 token 采样
++        (`_sample_dummy_text_ids`), 对 loss/梯度/ViT/mrope 零影响。
++        """
++        if not (self.use_megatron and target and self.task_type == 'causal_lm'
++                and self.mode in {'transformers', 'train'}):
++            return 0
++        if any('input_ids' not in r for r in batch):
++            return 0
++        if self.padding_free:
++            total = sum((r.get('length') or len(r['input_ids'])) for r in batch)
++            dummy_len = int(target) - int(total)
++            need_pop = False
++        else:
++            # 普通 batch 的右 pad 由批内最长样本决定; 已达到峰值则无需 dummy
++            if max(len(r['input_ids']) for r in batch) >= int(target):
++                return 0
++            dummy_len = int(target)
++            need_pop = True
++        if dummy_len <= 0:
++            return 0
++        dummy_ids = self._sample_dummy_text_ids(batch, dummy_len)
++        dummy = {'input_ids': dummy_ids, 'labels': [-100] * dummy_len, 'length': dummy_len}
++        # 字段对齐: 各 1D 字段会被逐个 sum/cat/pad, dummy 缺字段会导致长度不齐
++        for key, pad_value in [('loss_scale', 0.), ('token_type_ids', 0)]:
++            if any(r.get(key) is not None for r in batch):
++                dummy[key] = [pad_value] * dummy_len
++        if any(r.get('mm_token_type_ids') is not None for r in batch):
++            # 多模态(mrope): packing_row 对 mm_token_type_ids 做 torch.cat, 缺失会崩;
++            # 全 0 表示纯文本 token, dummy 段/行不影响 ViT 与 mrope
++            dummy['mm_token_type_ids'] = torch.zeros(dummy_len, dtype=torch.int64)
++        first_channel = next((r.get('channel') for r in batch if r.get('channel') is not None), None)
++        if first_channel is not None:
++            # channel loss 按段/行索引 channels[i], dummy 需占位(loss 为 0)
++            dummy['channel'] = first_channel
++        batch.append(dummy)
++        return 1 if need_pop else 0
++
++    @staticmethod
++    def _pad_warmup_pop_dummy(res: Dict[str, Any], n_real: int) -> None:
++        """Slice off the dummy row appended by `_pad_warmup_append_dummy` (padded-batch layout),
++        so every per-sample field is exactly back to `n_real` rows."""
++        for key in ('input_ids', 'inputs_embeds', 'labels', 'loss_scale', 'token_type_ids',
++                    'mm_token_type_ids', 'attention_mask', 'attention_mask_2d', 'channel',
++                    'seq_lens', 'position_ids', 'text_position_ids'):
++            v = res.get(key)
++            if v is None:
++                continue
++            if torch.is_tensor(v):
++                if v.shape[0] == n_real + 1:
++                    res[key] = v[:-1]
++                elif key == 'position_ids' and v.ndim == 3 and v.shape[1] == n_real + 1:
++                    res[key] = v[:, :-1]  # mrope: (C, B, L)
++            elif isinstance(v, list) and len(v) == n_real + 1:
++                res[key] = v[:-1]
++
+     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+         """
+         Args:

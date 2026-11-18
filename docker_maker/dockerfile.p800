@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=iregistry.baidu-int.com/xpu/xmegatron_ubuntu2004_py312_torch290_release:3.7.1.0_19
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# 说明: 软件包安装(apt/pip/pssh源码)、时区、sshd 配置均已移至容器内执行的
+#       docker_patchs/deps_install.sh, 由 patch_apply.sh 头部自动调用, 改动经
+#       docker commit 固化进 BASE_IMAGE。本文件只保留镜像元数据(ENV/EXPOSE/WORKDIR),
+#       这些无法通过 commit 记录, 必须在此声明。
+# 时区(实际 /etc/localtime 由 deps_install.sh 设置, 此处声明供进程读取)
+ENV TZ=Asia/Shanghai
+EXPOSE 36000
+
+# Set environment variables
+ENV DISABLE_VERSION_CHECK=1
+
+ENV CUDART_DUMMY_REGISTER=1
+ENV CUDA_DEVICE_ORDER=OAM_ID
+
+ENV WANDB_DISABLED=true
+ENV SWANLAB_LOG_DIR=/workdir/swanlab_logs
+WORKDIR /workdir

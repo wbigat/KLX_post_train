@@ -1,0 +1,843 @@
+diff -ruN a/swift/megatron/trainers/base.py b/swift/megatron/trainers/base.py
+--- a/swift/megatron/trainers/base.py	2026-09-24 13:29:56.100607749 +0800
++++ b/swift/megatron/trainers/base.py	2026-09-24 13:29:56.113607836 +0800
+@@ -41,6 +41,7 @@
+ from swift.utils import (deep_getattr, gc_collect, get_current_device, get_last_valid_indices, get_logger, is_last_rank,
+                          is_master, ms_logger_context)
+ from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
++from .pad_warmup import wrap_pad_warmup
+ from .utils import TrainerState, build_streaming_dataloader, prepare_batch
+ 
+ try:
+@@ -935,6 +936,12 @@
+ 
+     def _prepare_dataloader(self, train_dataset, val_dataset=None):
+         args = self.args
++        # Pad-warmup (padding_free): pad the first batch(es) to the peak packed length so the
++        # caching allocator reserves the peak-shaped segments up-front. The dataset is only
++        # available here, so the length scan happens here. SWIFT_PAD_WARMUP=0 disables it.
++        if not getattr(self, '_pad_warmup_wrapped', False):
++            self._pad_warmup_wrapped = True
++            self.data_collator = wrap_pad_warmup(self.data_collator, args, train_dataset, self.template)
+         val_dataloader = None
+         if args.streaming:
+             train_dataloader = build_streaming_dataloader(args, train_dataset, self.data_collator)
+diff -ruN a/swift/megatron/trainers/pad_warmup.py b/swift/megatron/trainers/pad_warmup.py
+--- a/swift/megatron/trainers/pad_warmup.py	1970-01-01 08:00:00.000000000 +0800
++++ b/swift/megatron/trainers/pad_warmup.py	2026-09-24 13:29:56.115607850 +0800
+@@ -0,0 +1,686 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Pad-warmup for megatron training: pad the first batch to the peak packed length to fight memory
++fragmentation when `expandable_segments` is unavailable.
++
++Why
++---
++With `padding_free`, a micro-batch is one packed row whose length is the *sum* of the sample
++lengths, so it varies with the data order. On allocators without `expandable_segments` the caching
++allocator cannot grow a freed segment in place: once early (short) batches have carved the memory
++into small segments, a later (longer) batch cannot find a contiguous block even though the *total*
++free memory is enough:
++
++    torch.OutOfMemoryError: Tried to allocate 15.60 GiB. GPU 3 has a total capacity of 96.00 GiB
++    of which 38.53 GiB is free...
++
++The fix: pad the FIRST batch to the peak packed length, so the allocator reserves the big segments
++up-front and every later batch -- whose length is <= the warm-up one -- reuses them.
++
++How
++---
++* **Dummy segment.** A dummy sample of ``warmup_len - real_total`` tokens is appended before
++  ``packing_row``. It gets ``position_ids = range(pad)``, so it becomes one extra segment in
++  ``cu_seqlens``, with ``labels = -100`` / ``loss_scale = 0``: no loss, no gradient, and being a
++  separate causal segment it cannot influence the real tokens.
++* **Peak, not an upper bound.** Replay `MegatronPretrainingRandomSampler` (deterministic,
++  seed = epoch) for every data-parallel rank and every epoch and take the largest micro-batch.
++  Exact, with no quantile/coverage magic number. The old ``sum of the top-``micro_batch_size``
++  sample lengths`` is *not* used: it assumes the longest samples of the whole dataset land in one
++  micro-batch, which random shuffling essentially never produces -- reserving it turns step 0 into
++  an artificial global peak.
++* **Exactly once per rank.** `PadWarmupCollator` runs inside the dataloader worker, and a fresh
++  worker (with a fresh collator) is forked every epoch when `dataloader_persistent_workers=False`.
++  Besides a per-process counter it therefore claims a one-shot flag file, so the whole run pads one
++  batch per rank. Every padding is logged, so the behaviour stays auditable.
++* **Scan cache.** Encoding the dataset is the only expensive step and is a pure function of the
++  sample plus the tokenizer/template, so the per-sample length array is cached on disk. The key
++  holds exactly what can change a sample's token length -- see `_cache_entry`.
++
++Usage
++-----
++    SWIFT_PAD_WARMUP=1                 # enable it; off by default
++    SWIFT_PAD_WARMUP_LENGTH=8192       # explicit target packed length, skips the replay
++    SWIFT_PAD_WARMUP_CACHE=0           # disable the length cache
++    SWIFT_PAD_WARMUP_CACHE_DIR=/tmp/x  # keep the length cache somewhere else
++"""
++import hashlib
++import json
++import math
++import os
++import time
++from typing import Any, Callable, Dict, List, Optional, Tuple
++
++from swift.utils import get_env_args, get_logger
++
++logger = get_logger()
++
++# How many consecutive batches a dataloader worker pads once it has claimed the warm-up.
++_WARMUP_BATCHES = 1
++# Guard against pathological datasets: replay at most this many (epoch x sample) combinations.
++_REPLAY_MAX_SAMPLES = 50_000_000
++
++
++def _scan_num_proc(args) -> int:
++    """Number of fork workers for the length scan (scales with `dataset_num_proc`)."""
++    return max(1, min(32, (getattr(args, 'dataset_num_proc', 1) or 1) * 4))
++
++
++def _align(length: int, args) -> int:
++    """Round the warm-up length up to the attention-backend alignment (`get_padding_to`)."""
++    try:
++        from swift.megatron.utils.utils import get_padding_to
++        padding_to = get_padding_to(args)
++    except Exception:
++        padding_to = None
++    if padding_to:
++        return math.ceil(length / padding_to) * padding_to
++    return length
++
++
++def _data_parallel_size(args) -> int:
++    try:
++        import torch.distributed as dist
++        world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
++    except Exception:
++        world = 1
++    tp = max(1, int(getattr(args, 'tensor_model_parallel_size', 1) or 1))
++    pp = max(1, int(getattr(args, 'pipeline_model_parallel_size', 1) or 1))
++    cp = max(1, int(getattr(args, 'context_parallel_size', 1) or 1))
++    return max(1, world // (tp * pp * cp))
++
++
++def _num_epochs(args, total_samples: int, step_samples: int) -> int:
++    """How many distinct sampler epochs this run will walk through."""
++    if step_samples <= 0:
++        return 1
++    active = (total_samples // step_samples) * step_samples
++    if active <= 0:
++        return 1
++    train_iters = getattr(args, 'train_iters', None)
++    if train_iters:
++        gbs = max(1, int(getattr(args, 'global_batch_size', 1) or 1))
++        return max(1, math.ceil(int(train_iters) * gbs / active))
++    return max(1, int(getattr(args, 'num_train_epochs', 1) or 1))
++
++
++def _current_data_parallel_rank() -> Optional[int]:
++    try:
++        from megatron.core import parallel_state as mpu
++        return mpu.get_data_parallel_rank()
++    except Exception:
++        return None
++
++
++def replay_peak_batch_length(args, hf_ds, lengths: List[int], group_size: int,
++                             agg: str = 'sum', dp_rank: Optional[int] = None) -> Optional[int]:
++    """Largest packed length over every micro-batch this run will execute.
++
++    `MegatronPretrainingRandomSampler` is deterministic (seed = epoch), so replaying it yields
++    exactly the batches the run will see. `agg` is ``'sum'`` for padding_free (the packed row is
++    the concatenation of the samples) and ``'max'`` for the padded layout (the row length is the
++    longest sample of the batch).
++
++    With `dp_rank` given, only that rank's micro-batches are replayed: every rank owns its own
++    device, so reserving the *global* peak on all of them pads 7 out of 8 ranks with a batch they
++    will never see (measured here: a rank's own peak is only 64-100% of the global one).
++    """
++    try:
++        from swift.megatron.trainers.batch_sampler import MegatronPretrainingRandomSampler
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Cannot import the batch sampler: {e}')
++        return None
++
++    total = len(lengths)
++    if total <= 0:
++        return None
++    try:
++        ds_len = len(hf_ds)
++    except Exception:
++        ds_len = None
++    if ds_len is not None and ds_len != total:
++        # An index shift would make `lengths[i]` describe the wrong sample.
++        logger.warning(f'[pad_warmup] Disabled: the length array has {total} rows but the dataset '
++                       f'has {ds_len}.')
++        return None
++    dp = _data_parallel_size(args)
++    group_size = max(1, min(int(group_size or 1), total))
++    n_epochs = _num_epochs(args, total, group_size * dp)
++    if n_epochs * total > _REPLAY_MAX_SAMPLES:
++        n_epochs = 1
++        logger.warning(f'[pad_warmup] Dataset too large to replay every epoch; using epoch 0 only.')
++
++    ranks = list(range(dp)) if dp_rank is None else [dp_rank]
++    combine = sum if agg == 'sum' else max
++    ceiling = int(getattr(args, 'max_length', 0) or getattr(args, 'seq_length', 0) or 0)
++    best = 0
++    step_samples = group_size * dp
++    active = (total // step_samples) * step_samples
++    for epoch in range(n_epochs):
++        # Cumulative sample count, it legitimately exceeds `total` across epochs -- the real run
++        # keeps incrementing `sampler.consumed_samples` and derives `epoch` from it. It must be
++        # assigned after construction because the constructor asserts `consumed < total`.
++        consumed = epoch * active
++        for rank in ranks:
++            try:
++                sampler = MegatronPretrainingRandomSampler(
++                    hf_ds,
++                    total_samples=total,
++                    consumed_samples=0,
++                    micro_batch_size=group_size,
++                    data_parallel_rank=rank,
++                    data_parallel_size=dp,
++                    data_sharding=getattr(args, 'data_sharding', False),
++                    shuffle=getattr(args, 'train_dataloader_shuffle', True),
++                    group_by_length=getattr(args, 'group_by_length', False),
++                )
++                sampler.consumed_samples = consumed
++            except Exception as e:
++                logger.warning(f'[pad_warmup] Cannot build the sampler (epoch {epoch}, rank {rank}): {e}')
++                return None
++            for batch in sampler:
++                try:
++                    if any(lengths[i] <= 0 for i in batch):
++                        # Samples that failed to encode: fall back to the `max_length` ceiling so
++                        # the peak can only be over-, never under-estimated.
++                        if not ceiling:
++                            logger.warning('[pad_warmup] Disabled: some samples could not be '
++                                           'encoded and no max_length ceiling is available.')
++                            return None
++                        value = combine(ceiling if lengths[i] <= 0 else lengths[i] for i in batch)
++                    else:
++                        value = combine(lengths[i] for i in batch)
++                except Exception:
++                    return None
++                if value > best:
++                    best = value
++    logger.info(f'[pad_warmup] Replayed {n_epochs} epoch(s) for dp_rank={ranks}: '
++                f'peak {agg} of {group_size} consecutive sample(s) = {best or None}.')
++    return best or None
++
++
++# The template is shared with the scan workers through fork (copy-on-write), because pickling it
++# (e.g. via `datasets.map(num_proc=...)`) drops the initialized processor.
++_SCAN_TEMPLATE = None
++
++
++def _scan_row(row: Dict[str, Any]) -> int:
++    """Map one dataset row to its token length; 0 for failed samples."""
++    try:
++        encoded = _SCAN_TEMPLATE.encode(row, return_length=True)
++        lengths = encoded.get('lengths') or [len(encoded['input_ids'])]
++        return max(lengths)
++    except Exception:
++        return 0
++
++
++# ---------------------------------------------------------------------------
++# Length scan and its on-disk cache
++# ---------------------------------------------------------------------------
++# Bumping this invalidates every existing cache entry at once.
++_LENGTH_CACHE_VERSION = 2
++# A sample that fails to encode must not silently shrink the peak, so beyond this fraction of
++# failures the length array is treated as unreliable and pad-warmup gives up.
++_MAX_SCAN_FAILURE_RATIO = 0.05
++# Environment variables that decide how many tokens one multimodal (image/video) sample expands to.
++_MM_LENGTH_ENV_VARS = ('MAX_PIXELS', 'MIN_PIXELS', 'VIDEO_MAX_PIXELS', 'VIDEO_MIN_PIXELS',
++                       'VIDEO_TOTAL_PIXELS', 'FPS', 'FPS_MAX_FRAMES')
++# Arguments that decide how long a sample is *after* `template.encode`.
++#
++# Deliberately NOT in the key (they only decide which samples land in the same micro-batch and in
++# which order, never how long a single sample is): `train_iters`, `num_train_epochs`,
++# `global_batch_size`, `micro_batch_size`, `data_parallel_size` / `data_parallel_rank`,
++# `data_sharding`, `train_dataloader_shuffle`, `group_by_length`, `seq_length`,
++# `dataset_num_proc`, `output_dir`, `SWIFT_PAD_WARMUP_LENGTH`.
++_LENGTH_TEMPLATE_ARGS = ('template', 'system', 'max_length', 'truncation_strategy', 'max_pixels',
++                         'agent_template', 'norm_bbox', 'use_chat_template', 'padding_free',
++                         'template_backend', 'response_prefix', 'enable_thinking',
++                         'preserve_thinking', 'add_non_thinking_prefix')
++
++
++def _swift_version() -> str:
++    try:
++        from swift import __version__
++        return str(__version__)
++    except Exception:
++        return 'unknown'
++
++
++def _state_dir() -> Optional[str]:
++    """Directory for pad-warmup's on-disk state: the length cache and the one-shot warm-up flag.
++
++    It defaults to the working directory instead of ``$HOME``: both are throwaway artifacts, and
++    inside the workspace they disappear together with it rather than piling up forever.
++    """
++    d = os.environ.get('SWIFT_PAD_WARMUP_CACHE_DIR') or os.path.join(os.getcwd(), '.pad_warmup_cache')
++    try:
++        os.makedirs(d, exist_ok=True)
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Cannot create {d}: {e}')
++        return None
++    return d
++
++
++def _cache_dir() -> Optional[str]:
++    """`_state_dir()`, or None when the length cache is switched off."""
++    if os.environ.get('SWIFT_PAD_WARMUP_CACHE', '1').lower() in ('0', 'off', 'false', 'no'):
++        return None
++    return _state_dir()
++
++
++def _dataset_fingerprint(args) -> List[Any]:
++    """Fingerprint the data *content* (size + mtime_ns), so editing a local file invalidates the
++    cache. A remote dataset is identified by its id alone."""
++    out = []
++    for spec in (getattr(args, 'dataset', None) or []):
++        path = str(spec).split('#', 1)[0]
++        try:
++            st = os.stat(path)
++        except OSError:
++            out.append([str(spec), None])
++            continue
++        if os.path.isfile(path):
++            out.append([str(spec), [[os.path.basename(path), st.st_size, st.st_mtime_ns]]])
++            continue
++        items = []
++        for root, dirs, files in os.walk(path):
++            dirs.sort()
++            files.sort()
++            for fn in files:
++                fp = os.path.join(root, fn)
++                try:
++                    s = os.stat(fp)
++                except OSError:
++                    continue
++                items.append([os.path.relpath(fp, path), s.st_size, s.st_mtime_ns])
++            if len(items) > 4096:
++                items = items[:4096]
++                break
++        out.append([str(spec), items])
++    return out
++
++
++def _cache_entry(args, template, n: int) -> Optional[Tuple[str, Dict[str, Any]]]:
++    """``(path, key)`` of the length cache entry for this dataset and config; None if caching is off.
++
++    The key holds everything that can change a sample's token length, and nothing else: arguments
++    that only decide which samples share a micro-batch (see `_LENGTH_TEMPLATE_ARGS`) are excluded,
++    so changing them does not force a re-scan.
++    """
++    cache_dir = _cache_dir()
++    if not cache_dir:
++        return None
++    key = {
++        'version': _LENGTH_CACHE_VERSION,
++        # what the samples are: content and which subset is selected
++        'dataset': [str(x) for x in (getattr(args, 'dataset', None) or [])],
++        'fingerprint': _dataset_fingerprint(args),
++        'split_dataset_ratio': getattr(args, 'split_dataset_ratio', None),
++        'columns': getattr(args, 'columns', None),
++        'custom_dataset_info': [str(x) for x in (getattr(args, 'custom_dataset_info', None) or [])],
++        'dataset_shuffle': getattr(args, 'dataset_shuffle', None),
++        'n_samples': n,
++        # tokenizer and multimodal processor come from the model
++        'model': getattr(args, 'model', None),
++        'model_revision': getattr(args, 'model_revision', None),
++        # multimodal: pixels / frames
++        'mm_env': {k: os.environ.get(k) for k in _MM_LENGTH_ENV_VARS},
++        # safety net: a swift / processor upgrade invalidates every entry
++        'swift_version': _swift_version(),
++        'template_cls': type(template).__name__ if template is not None else None,
++        'processor_cls': type(getattr(template, 'processor', None)).__name__ if template else None,
++    }
++    for name in _LENGTH_TEMPLATE_ARGS:
++        key[f'tmpl.{name}'] = getattr(args, name, None)
++    src = json.dumps(key, sort_keys=True, default=str)
++    path = os.path.join(cache_dir,
++                        f'lengths_v{_LENGTH_CACHE_VERSION}_{hashlib.md5(src.encode()).hexdigest()[:16]}.json')
++    return path, key
++
++
++def _length_cache_load(path: str, n: int) -> Optional[Tuple[List[int], int]]:
++    """Read a cache entry, or None when it is missing, stale, or does not match ``n``."""
++    try:
++        with open(path) as f:
++            payload = json.load(f)
++    except Exception:
++        return None
++    if not isinstance(payload, dict) or payload.get('version') != _LENGTH_CACHE_VERSION:
++        return None
++    lengths = payload.get('lengths')
++    if not isinstance(lengths, list) or len(lengths) != n:
++        logger.info(f'[pad_warmup] Discarding the cached lengths: '
++                    f'{len(lengths) if isinstance(lengths, list) else "?"} rows != {n}.')
++        return None
++    return [int(v) for v in lengths], int(payload.get('n_failed', 0) or 0)
++
++
++def _length_cache_store(path: str, key: Dict[str, Any], lengths: List[int], n_failed: int) -> None:
++    """Write a cache entry atomically, so a crash or a concurrent run cannot leave a partial file."""
++    tmp = f'{path}.{os.getpid()}.tmp'
++    try:
++        with open(tmp, 'w') as f:
++            json.dump(
++                {
++                    'version': _LENGTH_CACHE_VERSION,
++                    'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
++                    'key': key,
++                    'n': len(lengths),
++                    'n_failed': n_failed,
++                    'lengths': lengths,
++                }, f)
++        os.replace(tmp, path)
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Cannot store the cached lengths: {e}')
++        try:
++            os.remove(tmp)
++        except OSError:
++            pass
++
++
++def scan_sample_lengths(dataset, template, args) -> Optional[Tuple[List[int], int]]:
++    """Encode the dataset once and return every sample's token length (same value on all ranks).
++
++    Returns ``(lengths, n_failed)`` where ``lengths[i]`` is the token length of sample ``i``. The
++    array always has exactly one slot per sample: a row that fails to encode keeps its slot as
++    ``0`` instead of being dropped, so indices never shift. Uses a precomputed ``length(s)`` column
++    when available, otherwise runs ``template.encode`` over the whole dataset on rank 0 (fork
++    pool), broadcasts the result and caches it on disk -- see "Length cache" in the module
++    docstring.
++    """
++    if dataset is None:
++        return None
++    if getattr(args, 'streaming', False):
++        # An IterableDataset is neither materialized nor re-iterable, so a stable per-sample array
++        # does not exist -- computing or caching one would be wrong.
++        logger.info_once('[pad_warmup] Length scan disabled: streaming=True.')
++        return None
++    try:
++        n = len(dataset)
++    except Exception:
++        return None
++    if n == 0:
++        return None
++
++    from swift.dataset.utils import LazyLLMDataset
++    hf_ds = dataset.dataset if isinstance(dataset, LazyLLMDataset) else dataset
++
++    # Fast path: a precomputed length column (lazy_tokenize=False).
++    for col in ('lengths', 'length'):
++        try:
++            vals = hf_ds[col]
++            if vals is not None and len(vals) == n:
++                return ([(max(v) if isinstance(v, (list, tuple)) else int(v)) for v in vals], 0)
++        except Exception:
++            pass
++
++    # Cross-rank rendezvous goes through the on-disk cache + a file lock, NOT a device
++    # collective: rank 0's scan (slow CPU image decoding) must not leave the other ranks inside
++    # an XCCL broadcast -- its watchdog kills the long-waiting collective (error 702, launch
++    # timed out). Blocking on a file lock has no such timeout, and for multi-node: a shared FS
++    # scans once for the whole cluster, a node-local FS scans once per node.
++    return _scan_via_cache(hf_ds, template, args, n)
++
++
++def _scan_via_cache(hf_ds, template, args, n: int) -> Optional[Tuple[List[int], int]]:
++    """Scan with the on-disk cache as the cross-rank rendezvous (no device collective).
++
++    Every rank: read the cache -> on a miss take the file lock and scan (only one process per
++    cache dir actually scans; the rest block on the lock -- which has no timeout -- then read the
++    freshly written cache). If the FS does not support `flock`, degrade to scanning independently
++    (the atomic cache write keeps that safe).
++    """
++    entry = _cache_entry(args, template, n)
++    if entry is None:
++        # 缓存关闭时无法做文件 rendezvous, 各 rank 独立扫描(无集合通信, 正确但冗余).
++        return _scan_rank0(hf_ds, template, args, n)
++
++    cache_path, _ = entry
++    cached = _length_cache_load(cache_path, n)
++    if cached is not None:
++        return cached
++
++    lock_path = cache_path + '.lock'
++    try:
++        import fcntl
++        with open(lock_path, 'w') as lf:
++            # 阻塞至持锁进程扫描完(无超时, 不会像 XCCL 集合通信那样被看门狗杀).
++            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
++            try:
++                cached = _length_cache_load(cache_path, n)   # 持锁后重读: 可能已被扫过
++                if cached is not None:
++                    return cached
++                return _scan_rank0(hf_ds, template, args, n)  # 由我来扫(并写缓存)
++            finally:
++                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
++    except Exception as e:
++        # flock 不支持(某些网络 FS)等 -> 退化为各 rank 独立扫描(原子写缓存, 并发安全).
++        logger.warning(f'[pad_warmup] Length-scan lock unavailable ({e}); scan independently.')
++        return _scan_rank0(hf_ds, template, args, n)
++
++
++def _scan_rank0(hf_ds, template, args, n: int) -> Optional[Tuple[List[int], int]]:
++    """Scan (on rank 0) for every sample's token length, using the on-disk cache if present."""
++    t0 = time.perf_counter()
++    entry = _cache_entry(args, template, n)
++    if entry:
++        cached = _length_cache_load(entry[0], n)
++        if cached is not None:
++            lengths, n_failed = cached
++            logger.info(f'[pad_warmup] Using the cached sample lengths: {n} rows, {n_failed} failed '
++                        f'({time.perf_counter() - t0:.2f}s, {entry[0]}).')
++            return lengths, n_failed
++
++    global _SCAN_TEMPLATE
++    _SCAN_TEMPLATE = template
++    num_proc = _scan_num_proc(args)
++    logger.info(f'[pad_warmup] Scanning {n} samples (num_proc={num_proc})...')
++    try:
++        import multiprocessing as mp
++        with mp.get_context('fork').Pool(num_proc) as pool:
++            lengths = pool.map(_scan_row, hf_ds, chunksize=max(1, n // (num_proc * 8)))
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Failed to scan the dataset: {e}')
++        return None
++    # One slot per sample: a failed row stays 0 so that `lengths[i]` keeps matching row i.
++    lengths = [int(v) if v else 0 for v in lengths]
++    n_failed = sum(1 for v in lengths if v <= 0)
++    ok = [v for v in lengths if v > 0]
++    logger.info(f'[pad_warmup] Scan finished: {n} rows, {len(ok)} valid, {n_failed} failed, '
++                f'mean={sum(ok) / max(1, len(ok)):.0f}, max={max(ok) if ok else 0}, '
++                f'took {time.perf_counter() - t0:.2f}s.')
++    if entry:
++        _length_cache_store(*entry, lengths, n_failed)
++    return lengths, n_failed
++
++
++def get_pad_warmup_length(args, dataset, template) -> Optional[int]:
++    """Resolve the warm-up peak length; ``None`` disables it.
++
++    One dummy-segment scheme either way -- only the aggregation differs:
++    * padding_free: a row is the concatenation of its samples, so the peak is the largest *sum*
++      over any micro-batch;
++    * otherwise: a row is padded to its longest sample, so the peak is the largest *max*.
++    """
++    if not get_env_args('SWIFT_PAD_WARMUP', bool, False):
++        return None
++    if getattr(args, 'context_parallel_size', 1) > 1:
++        logger.info_once('[pad_warmup] Disabled: context_parallel_size > 1 is not supported.')
++        return None
++    if getattr(template, 'mode', 'train') not in ('transformers', 'train'):
++        # RLHF/PRM trainers index per-segment logits via packed_seq_params.seq_lens; an extra
++        # dummy segment would shift the segment count.
++        logger.info_once(f'[pad_warmup] Disabled: template.mode={getattr(template, "mode", None)!r}.')
++        return None
++
++    max_length = getattr(args, 'max_length', None) or getattr(args, 'seq_length', None)
++    if not max_length or max_length <= 0:
++        return None
++    max_length = int(max_length)
++
++    if getattr(args, 'packing', False):
++        # packing bins are capped at max_length, so that is the peak packed length.
++        return _align(max_length, args)
++
++    override = os.environ.get('SWIFT_PAD_WARMUP_LENGTH')
++    if override:
++        return _align(int(override), args)
++
++    from swift.dataset.utils import LazyLLMDataset
++    hf_ds = dataset.dataset if isinstance(dataset, LazyLLMDataset) else dataset
++    scanned = scan_sample_lengths(dataset, template, args)
++    if not scanned:
++        logger.warning('[pad_warmup] Disabled: the sample lengths are unavailable.')
++        return None
++    lengths, n_failed = scanned
++    if n_failed and n_failed > _MAX_SCAN_FAILURE_RATIO * max(1, len(lengths)):
++        logger.warning(f'[pad_warmup] Disabled: {n_failed}/{len(lengths)} samples failed to encode '
++                       f'(> {_MAX_SCAN_FAILURE_RATIO:.0%}).')
++        return None
++
++    padding_free = getattr(args, 'padding_free', False)
++    group_size = max(1, int(getattr(args, 'micro_batch_size', 1) or 1))
++    dp_rank = _current_data_parallel_rank()
++    peak = replay_peak_batch_length(args, hf_ds, lengths, group_size,
++                                    agg='sum' if padding_free else 'max', dp_rank=dp_rank)
++    if not peak:
++        logger.warning('[pad_warmup] Disabled: the peak batch length is unavailable.')
++        return None
++    # `max_length` still truncates every sample, so it remains a hard ceiling.
++    return _align(min(peak, group_size * max_length if padding_free else max_length), args)
++
++
++def warmup_communicators() -> None:
++    """Force the lazy communicator (XCCL/BKCL) setup while the device still has free memory.
++
++    The collective backends build their context on the **first** collective of a process group,
++    and they allocate through the raw device API instead of the torch caching allocator. Without
++    pad-warmup that happens on the small step-0 batch; with pad-warmup step 0 *is* the
++    peak-shaped batch, so the device is already full and the backend cannot obtain its buffers:
++
++        [ERR][XCCL][kl3_init.cpp:237] param 10 data alloc failed
++        ValueError: [RUNTIME ERROR]: error code= 2, out of memory (at .../xccl/XCCLUtils.cpp:28)
++
++    This is not hypothetical: with 60 epochs the per-rank peaks grow (rank4 19908 -> 24773) and
++    step 1 dies this way. Running one tiny all-reduce per group up-front moves the allocation to
++    a point where the memory footprint is still small.
++    """
++    import torch
++    import torch.distributed as dist
++    if not (dist.is_available() and dist.is_initialized()):
++        return
++
++    # Every process group this run can use. Enumerated from `parallel_state` rather than a
++    # hand-written list, so groups added later (e.g. `get_expert_model_parallel_group`, which is
++    # the EP group and is easy to miss) are covered automatically.
++    groups = [(None, 'default')]  # (group, name); None means the default (world) group
++    seen = set()
++    try:
++        from megatron.core import parallel_state as mpu
++    except Exception:
++        mpu = None
++    for name in sorted(dir(mpu)) if mpu else []:
++        if not (name.startswith('get_') and name.endswith('_group')):
++            continue
++        fn = getattr(mpu, name, None)
++        if not callable(fn):
++            continue
++        try:
++            group = fn()
++            # Skip world_size 1: megatron short-circuits its collectives, so no context is ever
++            # built for them. Dedup on the object, not on the rank set: two groups over the same
++            # ranks are still two distinct communicators, each lazily creating its own context.
++            if group is None or dist.get_world_size(group) <= 1 or id(group) in seen:
++                continue
++        except Exception:
++            continue
++        seen.add(id(group))
++        groups.append((group, name))
++
++    buf = torch.zeros(1, dtype=torch.float32, device=torch.cuda.current_device())
++    failed = []
++    for group, name in groups:
++        try:
++            dist.all_reduce(buf, group=group)
++        except Exception as e:
++            failed.append(f'{name}: {e}')
++    torch.cuda.synchronize()
++    if failed:
++        logger.warning(f'[pad_warmup] Failed to warm up {len(failed)} communicator(s): {failed}')
++    logger.info_once(f'[pad_warmup] Warmed up {len(groups)} communicator(s) before the '
++                     f'peak-shaped batch: ' + ', '.join(f'{n}({dist.get_world_size(g)})'
++                                                        for g, n in groups))
++
++
++class PadWarmupCollator:
++    """Wrap a data collator so that the first batch of the run is padded to `length`.
++
++    `num_batches` is per process (every dataloader worker owns a copy of the collator), and with
++    `dataloader_persistent_workers=False` a new worker -- with a fresh copy -- is forked every
++    epoch. `flag_path` is therefore claimed atomically as well, so that the whole run pads exactly
++    one batch per rank. Every padding is logged so the behaviour stays auditable.
++    """
++
++    def __init__(self, collator: Callable[..., Dict[str, Any]], length: int, num_batches: int = 1,
++                 flag_path: Optional[str] = None):
++        self.collator = collator
++        self.length = length
++        self.num_batches = num_batches
++        self.flag_path = flag_path
++
++    def _claimed(self) -> bool:
++        """Atomically claim the one-shot warm-up for this rank; False if already taken."""
++        if not self.flag_path:
++            return True
++        try:
++            fd = os.open(self.flag_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++            os.close(fd)
++            return True
++        except FileExistsError:
++            return False
++        except Exception as e:
++            logger.warning(f'[pad_warmup] Cannot claim {self.flag_path} ({e}); warm up anyway.')
++            return True
++
++    def __call__(self, batch: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
++        if self.num_batches <= 0:
++            return self.collator(batch, **kwargs)
++        self.num_batches -= 1
++        if not self._claimed():
++            # Already warmed up in an earlier epoch (a fresh worker was forked).
++            logger.info(f'[pad_warmup] Warm-up already done, skip padding (pid {os.getpid()}).')
++            return self.collator(batch, **kwargs)
++        logger.info(f'[pad_warmup] Padding the first batch to {self.length} (pid {os.getpid()}).')
++        return self.collator(batch, pad_to_length=self.length, **kwargs)
++
++    def __repr__(self) -> str:
++        return (f'PadWarmupCollator(length={self.length}, num_batches={self.num_batches}, '
++                f'flag_path={self.flag_path}, collator={self.collator})')
++
++
++def _warmup_flag_path(args) -> Optional[str]:
++    state_dir = _state_dir()
++    if not state_dir:
++        return None
++    local_rank = os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0'))
++    key = f'{getattr(args, "output_dir", "")}:{local_rank}'
++    return os.path.join(state_dir, f'warmed_{hashlib.md5(key.encode()).hexdigest()[:16]}.flag')
++
++
++def wrap_pad_warmup(data_collator: Callable[..., Dict[str, Any]],
++                    args,
++                    dataset=None,
++                    template=None) -> Callable[..., Dict[str, Any]]:
++    """Pad the first batch of the run to the peak packed length, see the module docstring."""
++    length = get_pad_warmup_length(args, dataset, template)
++    if length is None:
++        return data_collator
++    # Allocate the collective backends' buffers now, while the device still has free memory --
++    # otherwise they are created on top of the peak-shaped warm-up batch and run out of memory.
++    try:
++        warmup_communicators()
++    except Exception as e:
++        logger.warning(f'[pad_warmup] Communicator warm-up failed: {e}')
++    logger.info_once(f'[pad_warmup] warmup: pad the first {_WARMUP_BATCHES} batch(es) '
++                     f'per dataloader worker to {length} '
++                     f'(padding_free={getattr(args, "padding_free", False)}).')
++    return PadWarmupCollator(data_collator, length, _WARMUP_BATCHES, flag_path=_warmup_flag_path(args))
+diff -ruN a/swift/template/base.py b/swift/template/base.py
+--- a/swift/template/base.py	2026-09-24 13:29:56.103607769 +0800
++++ b/swift/template/base.py	2026-09-24 13:29:56.117607863 +0800
+@@ -1647,10 +1647,18 @@
+         self._deepspeed_initialize = None
+         return models
+ 
+-    def data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
++    def data_collator(self,
++                      batch: List[Dict[str, Any]],
++                      *,
++                      padding_to: Optional[int] = None,
++                      pad_to_length: Optional[int] = None) -> Dict[str, Any]:
+         from swift.dataset import RowPreprocessor
+         if self.packing and isinstance(batch[0], list):
+             batch = sum(batch, start=[])
++        # Pad-warmup (megatron): 向首个 batch 追加一条 dummy 样本, 让分配器在 step 1 就按峰值
++        # 形状预留显存。dummy 为纯文本 token / labels=-100 / loss_scale=0; padding_free 下它成为
++        # 独立新段, 普通 batch 下它在 collate 后被切除(_pad_warmup_pop_dummy), 对原功能零影响。
++        n_dummy = self._pad_warmup_append_dummy(batch, pad_to_length)
+         if self.task_type == 'causal_lm':
+             if self.mode in {'transformers', 'train'}:
+                 res = self._data_collator(batch, padding_to=padding_to)
+@@ -1675,6 +1683,8 @@
+             extra_kwargs = [b['_extra_kwargs'] for b in batch if b.get('_extra_kwargs') is not None]
+             extra_kwargs = RowPreprocessor.rows_to_batched(extra_kwargs)
+             res.update({k: v for k, v in extra_kwargs.items() if k not in res})
++        if n_dummy:
++            self._pad_warmup_pop_dummy(res, len(batch) - n_dummy)
+         return res
+ 
+     @staticmethod
+@@ -1842,6 +1852,96 @@
+             res['labels'] = labels
+         return res
+ 
++    def _sample_dummy_text_ids(self, batch: List[Dict[str, Any]], n: int) -> List[int]:
++        """Sample `n` dummy input_ids from the TEXT tokens of the real batch.
++
++        仅从纯文本 token 中采样 dummy input_ids。多模态样本的媒体占位 token
++        (image/video_token_id) 数量必须与 ViT 输出的 embedding 数严格一致(masked_scatter),
++        若被采进 dummy 会导致越界访存(unspecified launch failure);
++        get_rope_index 也依赖媒体 token 与 grid_thw 一一对应, 缺失 grid 会算错 position_ids。
++        """
++        import random
++        exclude_ids = set(getattr(self.tokenizer, 'all_special_ids', None) or [])
++        for attr in ('image_token_id', 'video_token_id', 'audio_token_id'):
++            tid = getattr(self, attr, None)
++            if isinstance(tid, int):
++                exclude_ids.add(tid)
++        real_ids = []
++        for r in batch:
++            ids = r['input_ids']
++            ids = ids.tolist() if torch.is_tensor(ids) else list(ids)
++            mm_types = r.get('mm_token_type_ids')
++            if mm_types is not None:
++                mm_types = mm_types.tolist() if torch.is_tensor(mm_types) else list(mm_types)
++                ids = [i for i, t in zip(ids, mm_types) if t == 0]
++            real_ids.extend(i for i in ids if i not in exclude_ids)
++        return random.choices(real_ids, k=n) if real_ids else [self.tokenizer.pad_token_id] * n
++
++    def _pad_warmup_append_dummy(self, batch: List[Dict[str, Any]], target: Optional[int]) -> int:
++        """Append ONE dummy sample for pad-warmup (megatron SFT, both data layouts).
++
++        返回 1 表示追加的是普通 batch 的 dummy 行(collate 后需切除), 0 表示未追加或无需切除。
++
++        * padding_free(含 packing): dummy 把 packed 行补到 `target`, `packing_row` 逢 0 分段使其
++          成为独立新段, 因果隔离不影响真实 token;
++        * 普通 batch: dummy 长度 = 峰值样本长, 把整批右 pad 顶到 [mbs+1, W], 由
++          `_pad_warmup_pop_dummy` 在 collate 后切除, batch 内容精确回到 [mbs, W]。
++
++        dummy 恒为 labels=-100 / loss_scale=0, 且 input_ids 只从纯文本 token 采样
++        (`_sample_dummy_text_ids`), 对 loss/梯度/ViT/mrope 零影响。
++        """
++        if not (self.use_megatron and target and self.task_type == 'causal_lm'
++                and self.mode in {'transformers', 'train'}):
++            return 0
++        if any('input_ids' not in r for r in batch):
++            return 0
++        if self.padding_free:
++            total = sum((r.get('length') or len(r['input_ids'])) for r in batch)
++            dummy_len = int(target) - int(total)
++            need_pop = False
++        else:
++            # 普通 batch 的右 pad 由批内最长样本决定; 已达到峰值则无需 dummy
++            if max(len(r['input_ids']) for r in batch) >= int(target):
++                return 0
++            dummy_len = int(target)
++            need_pop = True
++        if dummy_len <= 0:
++            return 0
++        dummy_ids = self._sample_dummy_text_ids(batch, dummy_len)
++        dummy = {'input_ids': dummy_ids, 'labels': [-100] * dummy_len, 'length': dummy_len}
++        # 字段对齐: 各 1D 字段会被逐个 sum/cat/pad, dummy 缺字段会导致长度不齐
++        for key, pad_value in [('loss_scale', 0.), ('token_type_ids', 0)]:
++            if any(r.get(key) is not None for r in batch):
++                dummy[key] = [pad_value] * dummy_len
++        if any(r.get('mm_token_type_ids') is not None for r in batch):
++            # 多模态(mrope): packing_row 对 mm_token_type_ids 做 torch.cat, 缺失会崩;
++            # 全 0 表示纯文本 token, dummy 段/行不影响 ViT 与 mrope
++            dummy['mm_token_type_ids'] = torch.zeros(dummy_len, dtype=torch.int64)
++        first_channel = next((r.get('channel') for r in batch if r.get('channel') is not None), None)
++        if first_channel is not None:
++            # channel loss 按段/行索引 channels[i], dummy 需占位(loss 为 0)
++            dummy['channel'] = first_channel
++        batch.append(dummy)
++        return 1 if need_pop else 0
++
++    @staticmethod
++    def _pad_warmup_pop_dummy(res: Dict[str, Any], n_real: int) -> None:
++        """Slice off the dummy row appended by `_pad_warmup_append_dummy` (padded-batch layout),
++        so every per-sample field is exactly back to `n_real` rows."""
++        for key in ('input_ids', 'inputs_embeds', 'labels', 'loss_scale', 'token_type_ids',
++                    'mm_token_type_ids', 'attention_mask', 'attention_mask_2d', 'channel',
++                    'seq_lens', 'position_ids', 'text_position_ids'):
++            v = res.get(key)
++            if v is None:
++                continue
++            if torch.is_tensor(v):
++                if v.shape[0] == n_real + 1:
++                    res[key] = v[:-1]
++                elif key == 'position_ids' and v.ndim == 3 and v.shape[1] == n_real + 1:
++                    res[key] = v[:, :-1]  # mrope: (C, B, L)
++            elif isinstance(v, list) and len(v) == n_real + 1:
++                res[key] = v[:-1]
++
+     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+         """
+         Args:

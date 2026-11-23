@@ -37,7 +37,7 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH = os.environ.get('DEMO_PATCH',
-                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch'))
+                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch'))
 
 WORK = tempfile.mkdtemp(prefix='pw_real_')
 DECODE_COUNT_FILE = os.path.join(WORK, 'decode_count')
@@ -319,7 +319,122 @@ def main():
         check(f'cp={cp} 首个 batch 恰好 pad 到目标长度', total == target,
               f'(total={total}, target={target})')
 
+    real_data_collator_cases(pw, ns['_FakeTemplate'])
+
     print(f'\nDEMO10 OK: {OK} checks passed (artifacts in {WORK})')
+
+
+def real_data_collator_cases(pw, FakeTemplate):
+    """§6: drive the REAL upstream `Template._data_collator` (not a stand-in) and check the
+    carved tensor SHAPES for both layouts.
+
+    This is the end-to-end proof of the v10 padded-layout fix: upstream pads row 0 to
+    `ceil(max(seq_lens)/padding_to)*padding_to` and then `_pad_sequence` lifts the remaining
+    rows to that length, so a raised `padding_to` yields exactly `(mbs, target)` -- while v9's
+    extra dummy ROW yielded `(mbs+1, target)`, and the megatron causal mask
+    `(b, 1, target, target)` scaled with the row count too.
+    """
+    import math
+    import types as _types
+
+    import torch
+    from swift.template.base import Template
+
+    print('-- 6. REAL upstream `Template._data_collator`: carved shapes per layout')
+
+    def make_template(padding_free, cp=1):
+        # The real class, instantiated without a checkpoint: `_data_collator` only touches the
+        # attributes set here (verified against the shipped source), so the padding/mask code
+        # under test is upstream's own, unmodified.
+        t = Template.__new__(Template)
+        # `tokenizer` is a read-through property of `ProcessorMixin` (processor.tokenizer or
+        # the processor itself), so the stand-in goes in through `processor`.
+        t.processor = _types.SimpleNamespace(pad_token_id=0, all_special_ids=[1, 2])
+        t.padding_side = 'right'
+        t.mode = 'train'            # `is_training` is a property derived from `mode`
+        t.use_megatron = True
+        t.padding_free = padding_free
+        t.sequence_parallel_size = cp
+        t.packing = False
+        t.task_type = 'causal_lm'
+        t.image_token_id = 32000
+        # the v10 `_append_warmup_dummy` / `_sample_dummy_text_ids` from the patch
+        for name in ('_append_warmup_dummy', '_sample_dummy_text_ids',
+                     '_WARMUP_DUMMY_NEUTRAL', '_WARMUP_DUMMY_SKIP'):
+            attr = getattr(FakeTemplate, name)
+            setattr(t, name, _types.MethodType(attr, t) if callable(attr) else attr)
+        return t
+
+    def rows(lens):
+        return [{'input_ids': [5 + (i % 300) for i in range(n)], 'labels': [1] * n,
+                 'length': n, 'loss_scale': [1.] * n} for n in lens]
+
+    target, lens = 512, [100, 137, 96]
+    mbs = len(lens)
+
+    # --- padded layout, v10: no dummy row, padding_to raised ---
+    t = make_template(padding_free=False)
+    batch = rows(lens)
+    padding_to = t._append_warmup_dummy(batch, target, None)
+    res = t._data_collator(batch, padding_to=padding_to)
+    check('6 padded v10: input_ids 形状 == (mbs, target)',
+          tuple(res['input_ids'].shape) == (mbs, target), f'{tuple(res["input_ids"].shape)}')
+    check('6 padded v10: megatron 因果掩码 == (mbs, 1, target, target)',
+          tuple(res['attention_mask'].shape) == (mbs, 1, target, target),
+          f'{tuple(res["attention_mask"].shape)}')
+    check('6 padded v10: seq_lens 仍是真实行长（padding 不计入）',
+          res['seq_lens'] == lens, f'{res["seq_lens"]}')
+    check('6 padded v10: 真实 token 未被改动',
+          res['input_ids'][1, :lens[1]].tolist() == batch[1]['input_ids'][:lens[1]])
+    check('6 padded v10: padding 位置 labels == -100',
+          int((res['labels'][0, lens[0]:] != -100).sum()) == 0)
+
+    # --- padded layout, v9 shape: an appended dummy ROW ---
+    t9 = make_template(padding_free=False)
+    batch9 = rows(lens) + rows([target])          # v9's `dummy_len = target` extra row
+    res9 = t9._data_collator(batch9, padding_to=None)
+    check('6 padded v9: input_ids 形状 == (mbs+1, target)（过预留被真实代码确认）',
+          tuple(res9['input_ids'].shape) == (mbs + 1, target),
+          f'{tuple(res9["input_ids"].shape)} vs v10 {(mbs, target)}')
+    v10_mask = mbs * target * target
+    v9_mask = (mbs + 1) * target * target
+    check('6 padded v9: 因果掩码同比例膨胀',
+          tuple(res9['attention_mask'].shape) == (mbs + 1, 1, target, target)
+          and v9_mask > v10_mask, f'{v9_mask / v10_mask:.2f}x')
+
+    # --- padding_free: the dummy segment is unchanged by v10 ---
+    t2 = make_template(padding_free=True)
+    batch2 = rows(lens)
+    pt2 = t2._append_warmup_dummy(batch2, target, None)
+    res2 = t2._data_collator(batch2, padding_to=pt2)
+    check('6 padding_free: 打包成一行且长度 == target',
+          tuple(res2['input_ids'].shape) == (1, target), f'{tuple(res2["input_ids"].shape)}')
+    pos = res2['position_ids'][0].tolist()
+    starts = [i for i, v in enumerate(pos) if v == 0]
+    check('6 padding_free: dummy 是 cu_seqlens 里独立的一段',
+          starts == [0, lens[0], lens[0] + lens[1], sum(lens)], f'{starts}')
+    check('6 padding_free: dummy 段 labels 全 -100',
+          int((res2['labels'][0, sum(lens):] != -100).sum()) == 0)
+
+    # --- padded + CP: rows are 2*cp-padded first, the target still lands exactly ---
+    cp = 2
+    t3 = make_template(padding_free=False, cp=cp)
+    lens3 = [101, 99]
+    batch3 = rows(lens3)
+    pt3 = t3._append_warmup_dummy(batch3, target, None)
+    res3 = t3._data_collator(batch3, padding_to=pt3)
+    check(f'6 padded + cp={cp}: 形状 == (mbs, target)，2*cp 对齐不破坏目标',
+          tuple(res3['input_ids'].shape) == (len(lens3), target) and target % (2 * cp) == 0,
+          f'{tuple(res3["input_ids"].shape)}')
+
+    # --- a stale/underestimated target must not double the reservation ---
+    t4 = make_template(padding_free=False)
+    batch4 = rows([600])
+    pt4 = t4._append_warmup_dummy(batch4, target, 64)
+    res4 = t4._data_collator(batch4, padding_to=pt4)
+    check('6 padded: target 低于最长行时退回原 padding_to（不触发 ceil 翻倍）',
+          pt4 == 64 and tuple(res4['input_ids'].shape) == (1, 640),
+          f'padding_to={pt4}, shape={tuple(res4["input_ids"].shape)}')
 
 
 if __name__ == '__main__':

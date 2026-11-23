@@ -63,7 +63,7 @@ _stub_swift()
 def load_pad_warmup():
     if os.environ.get('DEMO_PATCH'):
         import re
-        lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch')).read().split('\n')
+        lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch')).read().split('\n')
         start = next(i for i, l in enumerate(lines) if l.startswith('@@ -0,0 +1,'))
         count = int(re.match(r'@@ -0,0 \+1,(\d+) @@', lines[start]).group(1))
         src = '\n'.join(l[1:] for l in lines[start + 1:start + 1 + count]) + '\n'

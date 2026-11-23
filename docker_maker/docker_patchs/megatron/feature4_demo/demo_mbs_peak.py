@@ -34,7 +34,7 @@ import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH = os.environ.get('DEMO_PATCH',
-                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch'))
+                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch'))
 
 N = 100_000
 DP = 8

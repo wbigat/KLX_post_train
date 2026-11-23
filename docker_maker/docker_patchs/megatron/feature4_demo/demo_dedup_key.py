@@ -17,7 +17,7 @@ import tempfile
 import types
 
 PATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
-                     'feature4_megatron_pad_warmup-v9.patch')
+                     'feature4_megatron_pad_warmup-v10.patch')
 
 
 def load_pad_warmup():

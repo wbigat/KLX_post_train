@@ -63,7 +63,7 @@ _stub_swift()
 
 def load_pad_warmup():
     if os.environ.get('DEMO_PATCH'):
-        lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch')).read().split('\n')
+        lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch')).read().split('\n')
         start = next(i for i, l in enumerate(lines) if l.startswith('@@ -0,0 +1,'))
         count = int(re.match(r'@@ -0,0 \+1,(\d+) @@', lines[start]).group(1))
         src = '\n'.join(l[1:] for l in lines[start + 1:start + 1 + count]) + '\n'
@@ -222,7 +222,7 @@ def main():
 
     print('== 6. real `_append_warmup_dummy` (from the patch): fields, text-only ids, CP sizing ==')
     # Exec the exact method text the patch ships, on a fake template self.
-    lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch')).read().split('\n')
+    lines = open(os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch')).read().split('\n')
     i0 = next(i for i, l in enumerate(lines) if l.startswith('+    def _sample_dummy_text_ids'))
     i1 = next(i for i in range(i0, len(lines)) if lines[i].startswith('+    def data_collator'))
     src = '\n'.join(l[1:] for l in lines[i0:i1])  # strip the diff '+'
@@ -276,11 +276,13 @@ def main():
     cat = torch.cat([r['mm_token_type_ids'] for r in batch], dim=-1)
     pos = torch.cat([r['position_ids'] for r in batch], dim=-1)
     assert cat.shape == (60,) and pos.shape == (3, 60)
-    # padded layout: dummy_len == target
+    # padded layout (v10): NO dummy row -- the rows are padded to `target` through the
+    # returned `padding_to` instead, so the carved shape is (mbs, target) and not
+    # (mbs+1, target). See demo_v10_fixes.py §2 for the full case.
     t.padding_free = False
     batch2 = [dict(r) for r in rows]
-    t._append_warmup_dummy(batch2, 64)
-    assert batch2[-1]['length'] == 64
+    out_padding_to = t._append_warmup_dummy(batch2, 64, None)
+    assert len(batch2) == len(rows) and out_padding_to == 64, (len(batch2), out_padding_to)
     # all-media batch: no text ids to sample -> pad_token_id fallback, still no crash
     t.padding_free = True
     batch3 = [{'input_ids': [32000, 32000], 'length': 2,

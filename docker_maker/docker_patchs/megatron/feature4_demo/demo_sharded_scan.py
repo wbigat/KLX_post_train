@@ -34,7 +34,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH = os.environ.get('DEMO_PATCH',
-                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v9.patch'))
+                       os.path.join(HERE, '..', 'feature4_megatron_pad_warmup-v10.patch'))
 DECODE_MS = float(os.environ.get('DEMO_DECODE_MS', '15'))
 
 
